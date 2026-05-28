@@ -1,0 +1,34 @@
+# Core ML/AI
+# Install torch/torchvision/torchaudio from PyTorch CUDA 12.6 index:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+# Audio
+librosa
+soundfile
+torchaudio
+torchcodec
+
+# Data
+pandas
+numpy
+
+# Image
+Pillow
+
+# Progress bar
+tqdm
+
+# Transformers (for model.py)
+transformers
+
+# TensorBoard
+tensorboard
+
+# Other
+scipy
+
+# For CSV and path handling
+python-dotenv
+
+# For conda-forge ffmpeg 4.4 (install via conda, not pip)
+# conda install -c conda-forge ffmpeg=4.4
