@@ -20,7 +20,6 @@ import random
 import sys
 import types
 from pathlib import Path
-from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -124,7 +123,7 @@ def load_config() -> types.SimpleNamespace:
         grad_accum_steps    = int(_get("GRAD_ACCUM_STEPS", "1")),
         cpu_offload_optim   = _get("CPU_OFFLOAD_OPTIM", "false").lower() == "true",
         # Validation & logging
-        val_split           = float(_get("VAL_SPLIT",   "0.1")),
+        val_split           = float(_get("VAL_SPLIT",   "0.3")),
         tensorboard_dir     = _get("TENSORBOARD_DIR",   "runs"),
         tb_log_every        = int(_get("TB_LOG_EVERY",  "10")),
     )
@@ -154,11 +153,7 @@ class LanguageLabeledDataset(Dataset):
 
     @property
     def num_speakers(self) -> int:
-        if hasattr(self.base, "num_speakers"):
-            return self.base.num_speakers
-        if hasattr(self.base, "dataset") and hasattr(self.base.dataset, "num_speakers"):
-            return self.base.dataset.num_speakers
-        raise AttributeError("Wrapped dataset does not expose num_speakers.")
+        return self.base.num_speakers
 
 
 def build_language_labels(
@@ -180,43 +175,6 @@ def build_language_labels(
             label = 0
         labels.append(label)
     return labels, unknown
-
-
-def parse_csv_paths(csv_config: str) -> list[str]:
-    """Parse comma-separated CSV paths from TRAIN_CSV config."""
-    csv_paths = [p.strip() for p in csv_config.split(",") if p.strip()]
-    if not csv_paths:
-        raise ValueError("TRAIN_CSV must contain at least one CSV path.")
-    return csv_paths
-
-
-def clone_csv_dataset_with_samples(
-    base: CSVMAVCelebDataset,
-    samples: list[tuple[str, Path, list[Path]]],
-    face_transform,
-) -> CSVMAVCelebDataset:
-    """Create a shallow clone of CSV dataset metadata with a new sample list."""
-    ds_cls = type(base)
-    ds = ds_cls.__new__(ds_cls)
-    for attr in [
-        "csv_path",
-        "repo_root",
-        "data_root",
-        "k_faces",
-        "max_audio_samples",
-        "sample_rate",
-        "use_vad",
-        "vad_threshold_db",
-    ]:
-        setattr(ds, attr, getattr(base, attr))
-    ds.face_transform = face_transform
-    ds.samples = list(samples)
-
-    speaker_counts: Counter[str] = Counter(s for s, _, _ in ds.samples)
-    ds.speakers = sorted(speaker_counts.keys())
-    ds.speaker_to_idx = {s: i for i, s in enumerate(ds.speakers)}
-    ds._speaker_counts = [speaker_counts[s] for s in ds.speakers]
-    return ds
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -598,131 +556,66 @@ def main() -> None:
 
 
 
-    # ── Dataset: CSV or folder mode from config ──────────────────────────────
+    # ── Dataset: Train on English CSV, validate on 20% of Urdu CSV ──
     train_tf = make_face_transform()
     val_tf   = make_val_face_transform()
-    repo_root = Path(__file__).parent.parent
-    train_samples_for_lang: list[tuple[str, Path, list[Path]]] = []
-    val_samples_for_lang: list[tuple[str, Path, list[Path]]] = []
-    num_speakers = 0
-    print("Loading dataset …")
-    if cfg.dataset_source == "csv":
-        csv_paths = parse_csv_paths(cfg.train_csv)
-        csv_datasets = [
-            CSVMAVCelebDataset(
-                csv_path=csv_path,
-                repo_root=repo_root,
-                k_faces=cfg.k_faces,
-                max_audio_sec=cfg.max_audio_sec,
-                face_transform=train_tf,
-                use_vad=cfg.use_vad,
-                vad_threshold_db=cfg.vad_threshold_db,
-            )
-            for csv_path in csv_paths
-        ]
-
-        merged_samples: list[tuple[str, Path, list[Path]]] = []
-        for ds in csv_datasets:
-            merged_samples.extend(ds.samples)
-        merged_dataset = clone_csv_dataset_with_samples(
-            csv_datasets[0],
-            merged_samples,
-            train_tf,
-        )
-
-        all_indices = list(range(len(merged_dataset)))
-        rng_split = random.Random(cfg.seed)
-        rng_split.shuffle(all_indices)
-        if 0.0 < cfg.val_split < 1.0 and len(all_indices) > 1:
-            n_val = max(1, int(round(len(all_indices) * cfg.val_split)))
-            n_val = min(n_val, len(all_indices) - 1)
-            val_indices = all_indices[:n_val]
-            train_indices = all_indices[n_val:]
-        else:
-            val_indices = []
-            train_indices = all_indices
-
-        train_samples = [merged_dataset.samples[i] for i in train_indices]
-        train_dataset = clone_csv_dataset_with_samples(merged_dataset, train_samples, train_tf)
-        if val_indices:
-            val_samples = [merged_dataset.samples[i] for i in val_indices]
-            val_dataset = clone_csv_dataset_with_samples(merged_dataset, val_samples, val_tf)
-        else:
-            val_dataset = None
-
-        train_weights = train_dataset.get_sample_weights()
-        dataset = train_dataset
-        train_samples_for_lang = train_dataset.samples
-        val_samples_for_lang = val_dataset.samples if val_dataset is not None else []
-        num_speakers = train_dataset.num_speakers
-
-        print(f"  Train CSVs     : {csv_paths}")
-        print(f"  Train: {len(train_dataset):,} samples · {train_dataset.num_speakers} speakers")
-        if val_dataset is not None:
-            print(f"  Val  : {len(val_dataset):,} samples ({cfg.val_split * 100:.0f}% split)")
-        else:
-            print("  Val  : disabled (VAL_SPLIT <= 0 or dataset too small)")
-    elif cfg.dataset_source == "folder":
-        full_dataset = MAVCelebDataset(
-            data_root=repo_root / cfg.data_root,
-            k_faces=cfg.k_faces,
-            max_audio_sec=cfg.max_audio_sec,
-            face_transform=train_tf,
-            use_vad=cfg.use_vad,
-            vad_threshold_db=cfg.vad_threshold_db,
-        )
-        all_indices = list(range(len(full_dataset)))
-        rng_split = random.Random(cfg.seed)
-        rng_split.shuffle(all_indices)
-        if 0.0 < cfg.val_split < 1.0 and len(all_indices) > 1:
-            n_val = max(1, int(round(len(all_indices) * cfg.val_split)))
-            n_val = min(n_val, len(all_indices) - 1)
-            val_indices = all_indices[:n_val]
-            train_indices = all_indices[n_val:]
-            train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-            val_dataset = torch.utils.data.Subset(
-                MAVCelebDataset(
-                    data_root=repo_root / cfg.data_root,
-                    k_faces=cfg.k_faces,
-                    max_audio_sec=cfg.max_audio_sec,
-                    face_transform=val_tf,
-                    use_vad=cfg.use_vad,
-                    vad_threshold_db=cfg.vad_threshold_db,
-                ),
-                val_indices,
-            )
-        else:
-            train_dataset = full_dataset
-            val_dataset = None
-
-        # Keep existing balanced sampling behavior in folder mode.
-        if isinstance(train_dataset, MAVCelebDataset):
-            train_weights = train_dataset.get_sample_weights()
-            dataset = train_dataset
-            train_samples_for_lang = train_dataset.samples
-            num_speakers = train_dataset.num_speakers
-        else:
-            # Subset over MAVCelebDataset: compute per-speaker counts for subset.
-            subset_samples = [full_dataset.samples[i] for i in train_indices]
-            subset_speaker_counts = Counter(s for s, _, _ in subset_samples)
-            train_weights = [1.0 / max(subset_speaker_counts[s], 1) for s, _, _ in subset_samples]
-            dataset = train_dataset
-            train_samples_for_lang = subset_samples
-            num_speakers = full_dataset.num_speakers
-
-        if val_dataset is not None:
-            val_samples_for_lang = [full_dataset.samples[i] for i in val_indices]
-
-        print(f"  Train: {len(train_dataset):,} samples")
-        if val_dataset is not None:
-            print(f"  Val  : {len(val_dataset):,} samples ({cfg.val_split * 100:.0f}% split)")
-        else:
-            print("  Val  : disabled (VAL_SPLIT <= 0 or dataset too small)")
-    else:
-        raise ValueError(f"Unknown DATASET_SOURCE={cfg.dataset_source!r}. Choose csv or folder.")
-
+    print("Loading dataset … (English train, Urdu val mode)")
+    from math import ceil
+    # Training set: English only
+    train_csv_path = str(Path(__file__).parent.parent / "data_train/comp/v1_train_English.csv")
+    train_dataset = CSVMAVCelebDataset(
+        csv_path=train_csv_path,
+        repo_root=Path(__file__).parent.parent,
+        k_faces=cfg.k_faces,
+        max_audio_sec=cfg.max_audio_sec,
+        face_transform=train_tf,
+        use_vad=cfg.use_vad,
+        vad_threshold_db=cfg.vad_threshold_db,
+    )
+    print(f"  Train: {len(train_dataset):,} samples · {train_dataset.num_speakers} speakers")
     if cfg.use_vad:
         print(f"  VAD enabled: threshold={cfg.vad_threshold_db:.1f}dB")
+
+    # Validation set: 20% of Urdu only
+    val_csv_path = str(Path(__file__).parent.parent / "data_train/comp/v1_train_Urdu.csv")
+    full_val_dataset = CSVMAVCelebDataset(
+        csv_path=val_csv_path,
+        repo_root=Path(__file__).parent.parent,
+        k_faces=cfg.k_faces,
+        max_audio_sec=cfg.max_audio_sec,
+        face_transform=val_tf,
+        use_vad=cfg.use_vad,
+        vad_threshold_db=cfg.vad_threshold_db,
+    )
+    n_val = ceil(len(full_val_dataset) * 0.30)
+    all_val_indices = list(range(len(full_val_dataset)))
+    rng_split = random.Random(cfg.seed)
+    rng_split.shuffle(all_val_indices)
+    val_indices = all_val_indices[:n_val]
+    ds_cls = type(full_val_dataset)
+    val_dataset = ds_cls.__new__(ds_cls)
+    for attr in [
+        "data_root",
+        "repo_root",
+        "csv_path",
+        "k_faces",
+        "max_audio_samples",
+        "sample_rate",
+        "speakers",
+        "speaker_to_idx",
+        "_speaker_counts",
+        "use_vad",
+        "vad_threshold_db",
+    ]:
+        if hasattr(full_val_dataset, attr):
+            setattr(val_dataset, attr, getattr(full_val_dataset, attr))
+    val_dataset.face_transform = val_tf
+    val_dataset.samples = [full_val_dataset.samples[i] for i in val_indices]
+
+    # Training weights
+    train_weights = train_dataset.get_sample_weights()
+    dataset = train_dataset
+    print(f"  Val: {len(val_indices):,} samples (20% of Urdu)")
 
     if cfg.enable_lase:
         if cfg.fusion_type == "late":
@@ -730,7 +623,7 @@ def main() -> None:
         if cfg.num_languages < 2:
             raise ValueError("NUM_LANGUAGES must be >= 2 when ENABLE_LASE=true.")
 
-        train_lang_labels, train_unknown = build_language_labels(train_samples_for_lang, cfg.lang_keywords)
+        train_lang_labels, train_unknown = build_language_labels(dataset.samples, cfg.lang_keywords)
         dataset = LanguageLabeledDataset(dataset, train_lang_labels)
         print(f"  Language labels (train): inferred {len(train_lang_labels):,} samples")
         if train_unknown > 0:
@@ -740,7 +633,7 @@ def main() -> None:
             )
 
         if val_dataset is not None:
-            val_lang_labels, val_unknown = build_language_labels(val_samples_for_lang, cfg.lang_keywords)
+            val_lang_labels, val_unknown = build_language_labels(val_dataset.samples, cfg.lang_keywords)
             val_dataset = LanguageLabeledDataset(val_dataset, val_lang_labels)
             print(f"  Language labels (val)  : inferred {len(val_lang_labels):,} samples")
             if val_unknown > 0:
@@ -791,7 +684,7 @@ def main() -> None:
         model = FusionModel(
             face_encoder=face_enc,
             audio_encoder=audio_enc,
-            num_speakers=num_speakers,
+            num_speakers=dataset.num_speakers,
             embed_dim=cfg.embed_dim,
             mask_prob=cfg.mask_prob,
         ).to(device)
@@ -799,7 +692,7 @@ def main() -> None:
         model = CrossAttentionFusionModel(
             face_encoder=face_enc,
             audio_encoder=audio_enc,
-            num_speakers=num_speakers,
+            num_speakers=dataset.num_speakers,
             embed_dim=cfg.embed_dim,
             mask_prob=cfg.mask_prob,
             num_heads=cfg.cross_attn_heads,
@@ -809,7 +702,7 @@ def main() -> None:
         model = GatedFusionModel(
             face_encoder=face_enc,
             audio_encoder=audio_enc,
-            num_speakers=num_speakers,
+            num_speakers=dataset.num_speakers,
             embed_dim=cfg.embed_dim,
             mask_prob=cfg.mask_prob,
             num_languages=cfg.num_languages if cfg.enable_lase else None,

@@ -63,7 +63,6 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
-import torchaudio
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
@@ -86,6 +85,7 @@ from model import (
 
 
 TARGET_SR: int = 16_000
+_TORCHAUDIO = None
 
 
 def _load_env() -> dict[str, str]:
@@ -128,34 +128,6 @@ def _resolve_path(repo_root: Path, value: str) -> Path:
     return path if path.is_absolute() else repo_root / path
 
 
-def _parse_csv_paths(csv_config: str) -> list[str]:
-    csv_paths = [p.strip() for p in csv_config.split(",") if p.strip()]
-    if not csv_paths:
-        raise ValueError("TRAIN_CSV must contain at least one CSV path when DATASET_SOURCE=csv.")
-    return csv_paths
-
-
-def _load_speakers_from_training_csvs(repo_root: Path, csv_paths: list[str]) -> list[str]:
-    speakers: set[str] = set()
-    for csv_cfg in csv_paths:
-        csv_path = _resolve_path(repo_root, csv_cfg)
-        if not csv_path.exists():
-            raise FileNotFoundError(f"Training CSV not found: {csv_path}")
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None:
-                raise ValueError(f"Training CSV has no header row: {csv_path}")
-            if "identity" not in reader.fieldnames:
-                raise ValueError(f"Training CSV missing 'identity' column: {csv_path}")
-            for row in reader:
-                identity = (row.get("identity") or "").strip()
-                if identity:
-                    speakers.add(identity)
-    if not speakers:
-        raise ValueError("No speaker identities found in TRAIN_CSV.")
-    return sorted(speakers)
-
-
 def _load_eval_rows_from_csv(csv_path: Path, repo_root: Path) -> list[tuple[str, Path, Path]]:
     """Load eval samples from a CSV containing key plus audio/face path columns."""
     with open(csv_path, newline="") as f:
@@ -191,8 +163,71 @@ def _load_eval_rows_from_csv(csv_path: Path, repo_root: Path) -> list[tuple[str,
     return rows
 
 
+def _load_speakers_from_train_csv(train_csv: Path) -> list[str]:
+    """Load unique speaker IDs from a training CSV.
+
+    Expected column priority:
+      - identity (preferred)
+      - speaker_id
+      - speaker
+    """
+    with open(train_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"Training CSV has no header row: {train_csv}")
+
+        id_col = None
+        for candidate in ("identity", "speaker_id", "speaker"):
+            if candidate in reader.fieldnames:
+                id_col = candidate
+                break
+
+        if id_col is None:
+            raise ValueError(
+                "Training CSV must contain one of ['identity', 'speaker_id', 'speaker']. "
+                f"Found columns: {reader.fieldnames}"
+            )
+
+        speakers = {
+            (row.get(id_col) or "").strip()
+            for row in reader
+            if (row.get(id_col) or "").strip()
+        }
+
+    if not speakers:
+        raise ValueError(f"No speaker IDs found in training CSV: {train_csv}")
+
+    return sorted(speakers)
+
+
 def _chunks(seq: list[tuple[str, Path, Path]], size: int) -> list[list[tuple[str, Path, Path]]]:
     return [seq[i : i + size] for i in range(0, len(seq), size)]
+
+
+def _summarize_eval_source(
+    title: str,
+    source: str,
+    rows: list[tuple[str, Path, Path]],
+) -> None:
+    """Print a compact summary of where evaluation samples are read from."""
+    print(f"  {title} source      : {source}")
+    print(f"  {title} samples     : {len(rows)}")
+    if not rows:
+        return
+
+    # Show first resolved sample path for quick verification.
+    key0, face0, audio0 = rows[0]
+    print(f"  {title} first key   : {key0}")
+    print(f"  {title} first face  : {face0}  [exists={face0.exists()}]")
+    print(f"  {title} first audio : {audio0}  [exists={audio0.exists()}]")
+
+    # Quick health signal for path resolution quality.
+    missing_face = sum(1 for _, f, _ in rows if not f.exists())
+    missing_audio = sum(1 for _, _, a in rows if not a.exists())
+    print(
+        f"  {title} missing     : faces={missing_face}  "
+        f"audio={missing_audio}"
+    )
 
 
 def _load_labels_csv(path: Path, protocol_label_col: str) -> dict[str, int]:
@@ -240,6 +275,12 @@ def make_eval_transform() -> transforms.Compose:
 
 def load_and_pad_audio(wav_path: Path, max_samples: int) -> torch.Tensor:
     """Load waveform, resample to 16 kHz, convert to mono, pad/crop to fixed size."""
+    global _TORCHAUDIO
+    if _TORCHAUDIO is None:
+        import torchaudio as _ta  # Delayed import for clearer startup diagnostics.
+        _TORCHAUDIO = _ta
+
+    torchaudio = _TORCHAUDIO
     waveform, sr = torchaudio.load(wav_path)
     if sr != TARGET_SR:
         waveform = torchaudio.functional.resample(waveform, sr, TARGET_SR)
@@ -363,24 +404,15 @@ def _evaluate_pair(
                 face_batch = torch.stack(face_tensors).to(device)
                 wave_batch = torch.stack(waveforms).to(device)
 
-
                 # Full modality protocol (P3 or P5)
                 mask_none = torch.zeros(len(batch), dtype=torch.bool, device=device)
-                out_full = model(face_batch, wave_batch, mask_faces=mask_none)
-                if isinstance(out_full, tuple) and len(out_full) == 3:
-                    _, logits_full, _ = out_full
-                else:
-                    _, logits_full = out_full
+                _, logits_full = model(face_batch, wave_batch, mask_faces=mask_none)
                 probs_full = torch.softmax(logits_full, dim=1)
                 pred_full_idxs = probs_full.argmax(dim=1).tolist()
 
                 # Audio-only protocol (P4 or P6)
                 mask_all = torch.ones(len(batch), dtype=torch.bool, device=device)
-                out_audio = model(face_batch, wave_batch, mask_faces=mask_all)
-                if isinstance(out_audio, tuple) and len(out_audio) == 3:
-                    _, logits_audio, _ = out_audio
-                else:
-                    _, logits_audio = out_audio
+                _, logits_audio = model(face_batch, wave_batch, mask_faces=mask_all)
                 probs_audio = torch.softmax(logits_audio, dim=1)
                 pred_audio_idxs = probs_audio.argmax(dim=1).tolist()
 
@@ -438,12 +470,12 @@ def main() -> None:
 
     ckpt_path = _abs(_get(env, "EVAL_ALL_CHECKPOINT", _get(env, "EVAL_CHECKPOINT", "checkpoints/best.pt")))
     data_train_root = _abs(_get(env, "DATA_ROOT", "Data"))
+    train_csv_cfg = _get(env, "EVAL_ALL_TRAIN_CSV", _get(env, "TRAIN_CSV", "data_train/comp/v1_train_English.csv")).strip()
+    train_csv_path = _resolve_path(repo_root, train_csv_cfg)
     data_test_root = _abs(_get(env, "DATA_TEST_ROOT", ""))
-    same_csv_cfg = _get(env, "EVAL_ALL_SAME_CSV", "").strip()
-    cross_csv_cfg = _get(env, "EVAL_ALL_CROSS_CSV", "").strip()
+    same_csv_cfg = _get(env, "EVAL_ALL_SAME_CSV", "data_train/comp/v1_test_English.csv").strip()
+    cross_csv_cfg = _get(env, "EVAL_ALL_CROSS_CSV", "data_train/comp/v1_test_Urdu.csv").strip()
     output_dir = _abs(_get(env, "OUTPUT_DIR", "checkpoints"))
-    dataset_source = _get(env, "DATASET_SOURCE", "folder").strip().lower()
-    train_csv_cfg = _get(env, "TRAIN_CSV", "").strip()
 
     lang_same = _get(env, "EVAL_LANG_SAME", "English").strip()
     lang_cross = _get(env, "EVAL_LANG_CROSS", "Urdu").strip()
@@ -466,13 +498,12 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_source_text = train_csv_cfg if dataset_source == "csv" else str(data_train_root)
-
     print("\n" + "═" * 72)
     print(" POLY-SIM  |  Unified Evaluation  |  P3 P4 P5 P6")
     print("═" * 72)
     print(f"  Checkpoint      : {ckpt_path}")
-    print(f"  Train source    : {train_source_text}")
+    print(f"  Train data      : {data_train_root}")
+    print(f"  Train CSV       : {train_csv_path}")
     print(f"  Test data       : {data_test_root}")
     print(f"  Same language   : {lang_same}")
     print(f"  Cross language  : {lang_cross}")
@@ -480,7 +511,6 @@ def main() -> None:
     print(f"  Output EN-EN    : {csv_en_en}")
     print(f"  Output EN-UR    : {csv_en_ur}")
     print(f"  TensorBoard dir : {tb_dir}")
-    print(f"  Dataset source   : {dataset_source}")
     print("═" * 72 + "\n")
 
     if not ckpt_path.exists():
@@ -509,21 +539,15 @@ def main() -> None:
     print(f"  Face/Image encoder: {face_encoder_name}")
     print(f"  Audio encoder     : {audio_encoder_name}")
 
-    if dataset_source == "csv":
-        train_csv_paths = _parse_csv_paths(train_csv_cfg)
-        speakers = _load_speakers_from_training_csvs(repo_root, train_csv_paths)
-        print(f"  Train CSVs       : {train_csv_paths}")
-    else:
-        faces_train = data_train_root / "faces"
-        if not faces_train.is_dir():
-            raise FileNotFoundError(f"Training faces directory not found: {faces_train}")
+    if not train_csv_path.exists():
+        raise FileNotFoundError(f"Training CSV not found: {train_csv_path}")
 
-        speakers = sorted(p.name for p in faces_train.iterdir() if p.is_dir())
+    speakers: list[str] = _load_speakers_from_train_csv(train_csv_path)
     num_speakers = len(speakers)
     # Challenge labels are class indices, so emit 0..N-1 directly.
     idx_to_num: dict[int, int] = {i: i for i in range(num_speakers)}
     num_to_idx: dict[int, int] = {i: i for i in range(num_speakers)}
-    print(f"  Speakers (train) : {num_speakers}\n")
+    print(f"  Speakers (train) : {num_speakers} (from training CSV)\n")
 
     model = build_model(resolved_cfg, num_speakers)
     model.load_state_dict(ckpt["model"])
@@ -536,29 +560,40 @@ def main() -> None:
 
     same_samples: list[tuple[str, Path, Path]]
     cross_samples: list[tuple[str, Path, Path]]
+    same_source: str
+    cross_source: str
     if same_csv_cfg:
         same_csv_path = _resolve_path(repo_root, same_csv_cfg)
         if not same_csv_path.exists():
             raise FileNotFoundError(f"EVAL_ALL_SAME_CSV not found: {same_csv_path}")
         same_samples = _load_eval_rows_from_csv(same_csv_path, repo_root)
+        same_source = str(same_csv_path)
         print(f"  Same-language CSV : {same_csv_path} ({len(same_samples)} rows)")
     else:
         same_samples = [
             (p.stem, p, data_test_root / "voices" / lang_same / f"{p.stem}.wav")
             for p in sorted((data_test_root / "faces" / lang_same).glob("*.jpg"))
         ]
+        same_source = f"folder:{data_test_root / 'faces' / lang_same}"
 
     if cross_csv_cfg:
         cross_csv_path = _resolve_path(repo_root, cross_csv_cfg)
         if not cross_csv_path.exists():
             raise FileNotFoundError(f"EVAL_ALL_CROSS_CSV not found: {cross_csv_path}")
         cross_samples = _load_eval_rows_from_csv(cross_csv_path, repo_root)
+        cross_source = str(cross_csv_path)
         print(f"  Cross-language CSV: {cross_csv_path} ({len(cross_samples)} rows)")
     else:
         cross_samples = [
             (p.stem, p, data_test_root / "voices" / lang_cross / f"{p.stem}.wav")
             for p in sorted((data_test_root / "faces" / lang_cross).glob("*.jpg"))
         ]
+        cross_source = f"folder:{data_test_root / 'faces' / lang_cross}"
+
+    print("\n  Input summary")
+    _summarize_eval_source("Same-lang", same_source, same_samples)
+    _summarize_eval_source("Cross-lang", cross_source, cross_samples)
+    print()
 
     labels_same: dict[str, int] | None = None
     if labels_same_csv:
